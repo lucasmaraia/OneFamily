@@ -15,7 +15,8 @@ typedef enum {
 } ConfigMode;
 #endif
 
-#define VPAD_MAX_SLOTS 2
+// The PS4 itself tops out at four players, so four virtual pads is the ceiling.
+#define VPAD_MAX_SLOTS 4
 
 typedef enum {
     VPAD_SOURCE_NONE = 0,
@@ -28,6 +29,10 @@ extern "C" {
 #endif
 
 // Multi-Slot Device Lifecycle
+// device_key identifies the physical device behind a slot: the Bluetooth address
+// for a BT pad, 0 for the USB pad. Two controllers of the same source but with
+// different keys get separate slots, and therefore separate players.
+int  vpad_slot_open_dev(VPadSource source, uint64_t device_key, int *out_slot);
 int  vpad_slot_open(VPadSource source, int *out_slot);
 void vpad_slot_close(int slot);
 bool vpad_slot_is_active(int slot);
@@ -47,6 +52,14 @@ const char* vpad_get_assigned_user(void);
 void vpad_check_user_rebind(ConfigMode mode);
 void vpad_pulse_ps_button(void);
 int  vpad_send_data(const OrbisPadData *data);
+
+/* Pad ownership, read out of the kernel log (build with -DONEFAMILY_OWNER_WATCH).
+ * Without it both calls are no-ops. The poll wants running a few times a second;
+ * note_pad_open() says which slot should claim the next virtual pad the kernel
+ * announces. While enabled this holds /dev/klog, so GoldHEN's log server on port
+ * 3232 cannot serve anyone -- diagnostic builds only. */
+void vpad_owner_watch_poll(void);
+void vpad_owner_note_pad_open(int slot);
 
 // Rumble / Vibration Callback & Polling
 typedef void (*vpad_rumble_cb_t)(uint8_t large_motor, uint8_t small_motor);

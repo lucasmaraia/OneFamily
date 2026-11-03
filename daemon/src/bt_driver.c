@@ -4,12 +4,19 @@
  * Implements native wireless DualSense support via /dev/bt kernel allowlist patching,
  * 78-byte extended HID report 0x31 decoding, 3D gyro quaternion orientation,
  * touchpad coordinate remapping (1920x1080 -> 1920x942), and Bluetooth force feedback.
+ *
+ * Multiple controllers: every /dev/bt event already carries the Bluetooth address
+ * of the controller that produced it, so the kernel side was never the limit --
+ * the reports used to be funnelled into one virtual pad. State is held per device
+ * here instead, keyed on that address, so each DualSense drives its own virtual
+ * DualShock 4 and so becomes its own player or guest.
  */
 
 #include "bt_driver.h"
 #include "daemon_syscalls.h"
 #include "vpad.h"
 #include "log.h"
+#include <stdio.h>
 #include <string.h>
 
 // Sony DualSense Identifiers
@@ -31,12 +38,308 @@ static volatile bool s_bt_running = false;
 static int s_bt_fd = -1;
 static int s_bt_queue = -1;
 static bool s_bt_registered = false;
+// How many successful registrations to undo on shutdown.
+static int s_bt_reg_count = 0;
 static bool s_bt_supported = false;
-static bool s_dualsense_connected = false;
-static int s_bt_vpad_slot = -1;
-static uint64_t s_physical_address = 0;
-static uint64_t s_last_input_time = 0;
 static uint32_t s_current_fw_bcd = 0x1250;
+
+// -------------------------------------------------------------
+// Connected DualSense controllers, one entry each
+// -------------------------------------------------------------
+
+typedef struct {
+    uint64_t address;         // Bluetooth address; 0 means the entry is free
+    int      vpad_slot;       // virtual pad this controller feeds, or -1
+    bool     connected;       // reports are arriving from it right now
+    uint64_t last_input_time; // for this device's own disconnect timeout
+    uint64_t away_since;      // when it went quiet while holding a pad, else 0
+    uint32_t reports_seen;    // valid pad reports delivered for this address
+    uint32_t decode_drops;    // of those, ones the decoder could not use
+    uint8_t  last_drop_len;   // shape of the most recent undecodable report
+    uint8_t  last_drop_id;
+    uint8_t  rumble_seq;      // output report sequence tag, per device
+} BtDevice;
+
+static BtDevice s_devices[BT_MAX_DEVICES];
+
+/* How long a DualSense may stay silent before it counts as away.
+ *
+ * Upstream used 3 s, chosen when only one DualSense could ever be connected.
+ * With two of them the console's Bluetooth link does not sustain both streams
+ * evenly: measured on FW 12.52, a controller in active use goes quiet for ~3 s
+ * at a stretch and sometimes for tens of seconds, with no decode failures at
+ * all (decode_drops stays 0, so the reports are not arriving and being
+ * discarded -- they are not arriving). Replacing one DualSense with a
+ * DualShock 4 makes the remaining one steady, which is what points at
+ * contention on the radio rather than anything in this daemon.
+ *
+ * So the timeout is a tolerance, not a measurement of death: it has to outlast
+ * the gaps the link actually produces. 10 s covers the observed ~3 s stalls
+ * with room to spare. */
+#define BT_INPUT_TIMEOUT_US 10000000ULL
+
+/* How long a controller's virtual pad is held open after it goes quiet.
+ *
+ * Deleting the pad the moment a controller drops is what loses the player: the
+ * PS4 binds an account to the *device*, so a new pad arrives with no owner and
+ * re-opens "Who's using this controller?" -- and whoever answers it can easily
+ * land the pad on the wrong account, which is how a guest's controller ends up
+ * belonging to the main user. Keeping the pad alive means the same Bluetooth
+ * address coming back reattaches to the same pad, account intact, no picker.
+ *
+ * Generous on purpose. Silences of 20-50 s were measured with two DualSense
+ * connected, so a minute of grace still let pads churn, and every churn is
+ * another chance for a guest to be reassigned to the wrong account. Ten minutes
+ * makes the pad effectively permanent for the length of a session; a controller
+ * that is really gone costs one held slot until then, and bt_dev_acquire()
+ * reclaims the longest-away entry when a new controller needs one. */
+#define BT_PAD_GRACE_US 600000000ULL
+
+/* How many times to register the DualSense VID/PID with the Bluetooth driver.
+ *
+ * The driver keeps one device entry per successful ioctl 0x8004622B, so N
+ * controllers need N registrations. A single registration is what used to cap
+ * this daemon at one DualSense: the second controller paired, the system even
+ * created an MBus device for it (DEVICE_ADDED type:1 subType:18), but its HID
+ * stream was never routed to /dev/bt, so no event ever arrived and no pad was
+ * ever created. Measured on FW 12.52: the repeats all return 0, and each one
+ * admits one more controller. */
+#ifndef ONEFAMILY_BT_REGISTRATIONS
+#define ONEFAMILY_BT_REGISTRATIONS BT_MAX_DEVICES
+#endif
+
+static void bt_devices_reset(void) {
+    for (int i = 0; i < BT_MAX_DEVICES; ++i) {
+        memset(&s_devices[i], 0, sizeof(s_devices[i]));
+        s_devices[i].vpad_slot = -1;
+    }
+}
+
+static void bt_dev_release(BtDevice *dev);
+
+static BtDevice* bt_dev_find(uint64_t address) {
+    if (!address) return NULL;
+    for (int i = 0; i < BT_MAX_DEVICES; ++i) {
+        if (s_devices[i].address == address) return &s_devices[i];
+    }
+    return NULL;
+}
+
+// The entry for this address, claiming a free one if the address is new.
+// Returns NULL when every entry is taken.
+static BtDevice* bt_dev_acquire(uint64_t address) {
+    BtDevice *dev = bt_dev_find(address);
+    if (dev) return dev;
+    if (!address) return NULL;
+
+    for (int i = 0; i < BT_MAX_DEVICES; ++i) {
+        if (s_devices[i].address == 0) {
+            memset(&s_devices[i], 0, sizeof(s_devices[i]));
+            s_devices[i].address = address;
+            s_devices[i].vpad_slot = -1;
+            s_devices[i].away_since = 0;
+            // Start the timeout clock now, so an entry that never produces a
+            // decodable report is reclaimed instead of held forever.
+            s_devices[i].last_input_time = daemon_sys_time_us();
+            daemon_log(LOG_LEVEL_INFO, "DualSense BT: new device 0x%llX (entry %d)",
+                       (unsigned long long)address, i);
+            return &s_devices[i];
+        }
+    }
+
+    /* Every entry taken. A long grace window means some of them may be held for
+     * controllers that are away, so give up the one that has been away longest
+     * rather than turn away a controller that is here and transmitting. */
+    BtDevice *oldest = NULL;
+    for (int i = 0; i < BT_MAX_DEVICES; ++i) {
+        if (s_devices[i].connected || !s_devices[i].away_since) continue;
+        if (!oldest || s_devices[i].away_since < oldest->away_since) {
+            oldest = &s_devices[i];
+        }
+    }
+
+    if (oldest) {
+        daemon_log(LOG_LEVEL_INFO,
+                   "DualSense BT: all %d entries in use; reclaiming 0x%llX (Slot %d), away longest, for 0x%llX",
+                   BT_MAX_DEVICES, (unsigned long long)oldest->address, oldest->vpad_slot,
+                   (unsigned long long)address);
+        bt_dev_release(oldest);
+        return bt_dev_acquire(address);
+    }
+
+    daemon_log(LOG_LEVEL_WARN,
+               "DualSense BT: all %d device entries in use and all connected, ignoring address 0x%llX",
+               BT_MAX_DEVICES, (unsigned long long)address);
+    return NULL;
+}
+
+#ifdef ONEFAMILY_BT_DIAG
+/* Diagnostics for "the second controller pairs but nothing arrives".
+ *
+ * The normal path drops any /dev/bt event whose type is outside 0x18..0x20, and
+ * any report that fails validation, without a word in the log -- so a log that
+ * shows one controller cannot distinguish "no event ever arrived for the second
+ * one" from "events arrived and were thrown away". This records both, per
+ * Bluetooth address, with hard caps so the log stays readable.
+ */
+#define BT_DIAG_MAX_ADDR 8
+#define BT_DIAG_LOG_PER_ADDR 6
+
+typedef struct {
+    uint64_t addr;
+    uint32_t events;        // events seen for this address
+    uint32_t logged;        // how many we have already written out
+    uint32_t accepted;      // reports that passed validation
+    uint32_t rejected;      // reports that failed it
+    uint8_t  seen_types[8]; // distinct event types, for the summary
+    uint32_t n_types;
+} BtDiagAddr;
+
+static BtDiagAddr s_diag[BT_DIAG_MAX_ADDR];
+static uint64_t s_diag_next_dump = 0;
+static uint32_t s_diag_overflow = 0;
+
+static BtDiagAddr* bt_diag_slot(uint64_t addr) {
+    for (int i = 0; i < BT_DIAG_MAX_ADDR; ++i) {
+        if (s_diag[i].addr == addr) return &s_diag[i];
+    }
+    for (int i = 0; i < BT_DIAG_MAX_ADDR; ++i) {
+        if (s_diag[i].addr == 0) {
+            memset(&s_diag[i], 0, sizeof(s_diag[i]));
+            s_diag[i].addr = addr;
+            daemon_log(LOG_LEVEL_INFO, "[DIAG] first event ever from address 0x%llX (diag entry %d)",
+                       (unsigned long long)addr, i);
+            return &s_diag[i];
+        }
+    }
+    ++s_diag_overflow;
+    return NULL;
+}
+
+// Every event off /dev/bt, before the 0x18..0x20 type filter.
+static void bt_diag_event(uint8_t ev_type, uint64_t addr, const uint8_t *raw) {
+    BtDiagAddr *d = bt_diag_slot(addr);
+    if (!d) return;
+
+    ++d->events;
+
+    int known = 0;
+    for (uint32_t i = 0; i < d->n_types; ++i) {
+        if (d->seen_types[i] == ev_type) { known = 1; break; }
+    }
+    if (!known && d->n_types < 8) {
+        d->seen_types[d->n_types++] = ev_type;
+        // A type never seen from this address is always worth a line: a
+        // filtered-out type is exactly how a controller goes silent.
+        daemon_log(LOG_LEVEL_INFO, "[DIAG] 0x%llX: event type 0x%02X (%s filter 0x18-0x20)",
+                   (unsigned long long)addr, ev_type,
+                   (ev_type < 0x18 || ev_type > 0x20) ? "OUTSIDE" : "inside");
+    }
+
+    if (d->logged < BT_DIAG_LOG_PER_ADDR) {
+        ++d->logged;
+        // All 16 bytes: the address occupies 8..15, and a 0x18 event carries
+        // the PID and VID at 4..7, so the tail is where the identity lives.
+        daemon_log(LOG_LEVEL_INFO,
+                   "[DIAG] 0x%llX event #%u type=0x%02X raw=%02X%02X%02X%02X%02X%02X%02X%02X"
+                   "%02X%02X%02X%02X%02X%02X%02X%02X",
+                   (unsigned long long)addr, d->events, ev_type,
+                   raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+                   raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15]);
+    }
+}
+
+// The report ioctl's verdict for an event that passed the type filter.
+static void bt_diag_report(uint64_t addr, long result, const uint8_t *report, int accepted) {
+    BtDiagAddr *d = bt_diag_slot(addr);
+    if (!d) return;
+
+    if (accepted) {
+        if (d->accepted == 0) {
+            daemon_log(LOG_LEVEL_INFO, "[DIAG] 0x%llX: first ACCEPTED report (len=%ld, id=0x%02X)",
+                       (unsigned long long)addr, result, report[1]);
+        }
+        ++d->accepted;
+        return;
+    }
+
+    ++d->rejected;
+    // Only the first few rejections per address; they repeat at 250 Hz.
+    if (d->rejected <= BT_DIAG_LOG_PER_ADDR) {
+        const char *why = "unknown";
+        if (result < 2)                   why = "ioctl returned < 2 (no data / error)";
+        else if (result > 80)             why = "length > 80";
+        else if (report[0] + 2 != result) why = "report[0]+2 != length";
+        else if (report[1] != 0x1F)       why = "report[1] != 0x1F (not a pad report)";
+        daemon_log(LOG_LEVEL_WARN, "[DIAG] 0x%llX: REJECTED report #%u result=%ld r0=0x%02X r1=0x%02X -- %s",
+                   (unsigned long long)addr, d->rejected, result, report[0], report[1], why);
+    }
+}
+
+// A standing tally every 5 s, so a controller that goes quiet is visible.
+static void bt_diag_dump(void) {
+    uint64_t now = daemon_sys_time_us();
+    if (now < s_diag_next_dump) return;
+    s_diag_next_dump = now + 5000000ULL;
+
+    for (int i = 0; i < BT_DIAG_MAX_ADDR; ++i) {
+        BtDiagAddr *d = &s_diag[i];
+        if (!d->addr) continue;
+
+        char types[40];
+        int o = 0;
+        for (uint32_t t = 0; t < d->n_types && o < (int)sizeof(types) - 6; ++t) {
+            o += snprintf(types + o, sizeof(types) - (size_t)o, "%02X ", d->seen_types[t]);
+        }
+        if (o > 0) types[o - 1] = 0; else types[0] = 0;
+
+        BtDevice *bd = bt_dev_find(d->addr);
+        daemon_log(LOG_LEVEL_INFO,
+                   "[DIAG] tally 0x%llX: events=%u accepted=%u rejected=%u types=[%s] pad_slot=%d",
+                   (unsigned long long)d->addr, d->events, d->accepted, d->rejected,
+                   types, bd ? bd->vpad_slot : -1);
+    }
+
+    if (s_diag_overflow) {
+        daemon_log(LOG_LEVEL_WARN, "[DIAG] %u events from more than %d distinct addresses",
+                   s_diag_overflow, BT_DIAG_MAX_ADDR);
+    }
+}
+#endif /* ONEFAMILY_BT_DIAG */
+
+/* The controller went quiet but keeps its pad, and so keeps its account.
+ * A neutral sample goes out first: a controller that drops mid-press would
+ * otherwise leave the pad holding that button down for the whole grace period. */
+static void bt_dev_mark_away(BtDevice *dev, uint64_t now) {
+    if (!dev) return;
+
+    if (dev->vpad_slot >= 0) {
+        OrbisPadData neutral;
+        memset(&neutral, 0, sizeof(neutral));
+        neutral.leftStick.x = 128;
+        neutral.leftStick.y = 128;
+        neutral.rightStick.x = 128;
+        neutral.rightStick.y = 128;
+        neutral.connected = 1;
+        neutral.count = 1;
+        neutral.timestamp = now;
+        vpad_send_data_slot(dev->vpad_slot, &neutral);
+    }
+
+    dev->connected = false;
+    dev->away_since = now;
+}
+
+// Give up one device: close its virtual pad and free the entry.
+static void bt_dev_release(BtDevice *dev) {
+    if (!dev) return;
+    if (dev->vpad_slot >= 0) {
+        vpad_slot_close(dev->vpad_slot);
+    }
+    memset(dev, 0, sizeof(*dev));
+    dev->vpad_slot = -1;
+}
+
 
 // -------------------------------------------------------------
 // CRC32 Calculation for DualSense Bluetooth Reports
@@ -392,7 +695,7 @@ static int apply_kernel_allowlist_patch(int restore, uint32_t fw_version) {
 // Bluetooth Report 0x31 / 0x01 Decoder
 // -------------------------------------------------------------
 
-static void decode_dualsense_bt_report(const uint8_t* report, size_t length) {
+static void decode_dualsense_bt_report(BtDevice* dev, const uint8_t* report, size_t length) {
     static const uint32_t dpad_map[9] = {
         DS4_BUTTON_DPAD_UP,
         DS4_BUTTON_DPAD_UP | DS4_BUTTON_DPAD_RIGHT,
@@ -405,10 +708,13 @@ static void decode_dualsense_bt_report(const uint8_t* report, size_t length) {
         0
     };
 
-    if (!report) return;
+    if (!dev || !report) return;
 
     uint8_t simple[10] = {0};
     const uint8_t* data = NULL;
+
+    dev->last_drop_len = (uint8_t)(length > 255 ? 255 : length);
+    dev->last_drop_id = report[0];
 
     if (length == 10 && report[0] == 0x01) {
         // Remap 10-byte simple report to match 78-byte payload indices (Diram1x logic)
@@ -427,34 +733,67 @@ static void decode_dualsense_bt_report(const uint8_t* report, size_t length) {
                                 ((uint32_t)report[77] << 24);
         uint32_t computed_crc = bt_calc_crc32(0xA1, report, 74);
         if (computed_crc != expected_crc) {
-            return; // CRC mismatch: corrupted Bluetooth packet
+            ++dev->decode_drops; // CRC mismatch: corrupted Bluetooth packet
+            return;
         }
         data = report + 2; // Data payload begins at offset 2
     } else {
+        ++dev->decode_drops;
         return;
     }
 
-    if (!data) return;
-
-    unsigned direction = data[7] & 0x0F;
-    if (direction > 8) return;
-
-    if (!s_dualsense_connected) {
-        s_dualsense_connected = true;
-        if (s_bt_vpad_slot < 0) {
-            vpad_slot_open(VPAD_SOURCE_BT, &s_bt_vpad_slot);
-        }
-        int slot_num = vpad_get_assigned_slot_num(s_bt_vpad_slot);
-        if (slot_num == 2) {
-            daemon_notify("OneFamily: DualSense Wireless (Player 2)");
-        } else {
-            daemon_notify("OneFamily: DualSense Wireless Connected");
-        }
-        daemon_log(LOG_LEVEL_INFO, "controller_connected: DualSense BT (Slot %d, Player %d)",
-                   s_bt_vpad_slot, slot_num);
+    if (!data) {
+        ++dev->decode_drops;
+        return;
     }
 
-    s_last_input_time = daemon_sys_time_us();
+    unsigned direction = data[7] & 0x0F;
+    if (direction > 8) {
+        ++dev->decode_drops;
+        return;
+    }
+
+    if (!dev->connected) {
+        if (dev->vpad_slot >= 0) {
+            /* It still holds the pad it had before it went quiet, so it comes
+             * straight back to the same player and the same account. No new
+             * device, no user picker, nothing to answer wrongly. */
+            uint64_t away_us = dev->away_since ? (daemon_sys_time_us() - dev->away_since) : 0;
+            dev->connected = true;
+            dev->away_since = 0;
+
+            int player = vpad_get_assigned_slot_num(dev->vpad_slot);
+            daemon_log(LOG_LEVEL_INFO,
+                       "controller_returned: DualSense BT 0x%llX kept Slot %d (Player %d) after %llu ms away "
+                       "[reports=%u decode_drops=%u]",
+                       (unsigned long long)dev->address, dev->vpad_slot, player,
+                       (unsigned long long)(away_us / 1000),
+                       dev->reports_seen, dev->decode_drops);
+            daemon_notify("OneFamily: DualSense (Player %d) Reconnected", player);
+        } else {
+            // Keyed on this controller's address, so a second DualSense opens a
+            // second virtual pad rather than reusing the first one's.
+            if (vpad_slot_open_dev(VPAD_SOURCE_BT, dev->address, &dev->vpad_slot) != 0 ||
+                dev->vpad_slot < 0) {
+                // No virtual pad to be had. Drop the report rather than feed it
+                // to somebody else's pad; the next report retries.
+                dev->vpad_slot = -1;
+                daemon_log(LOG_LEVEL_WARN, "DualSense BT 0x%llX: no virtual pad slot available",
+                           (unsigned long long)dev->address);
+                dev->last_input_time = daemon_sys_time_us();
+                return;
+            }
+            dev->connected = true;
+            dev->away_since = 0;
+
+            int player = vpad_get_assigned_slot_num(dev->vpad_slot);
+            daemon_notify("OneFamily: DualSense Wireless (Player %d)", player);
+            daemon_log(LOG_LEVEL_INFO, "controller_connected: DualSense BT 0x%llX (Slot %d, Player %d)",
+                       (unsigned long long)dev->address, dev->vpad_slot, player);
+        }
+    }
+
+    dev->last_input_time = daemon_sys_time_us();
 
     OrbisPadData ds4;
     memset(&ds4, 0, sizeof(ds4));
@@ -505,19 +844,98 @@ static void decode_dualsense_bt_report(const uint8_t* report, size_t length) {
     }
 
     ds4.connected = 1;
-    ds4.timestamp = s_last_input_time;
+    ds4.timestamp = dev->last_input_time;
 
-    // Send translated controller packet to Virtual DualShock 4
-    if (s_bt_vpad_slot >= 0) {
-        vpad_send_data_slot(s_bt_vpad_slot, &ds4);
-    } else {
-        vpad_send_data(&ds4);
+    // Send the translated packet to this controller's own Virtual DualShock 4.
+    // No fallback to vpad_send_data(): with several pads open that would pick an
+    // arbitrary slot and move the wrong player.
+    if (dev->vpad_slot >= 0) {
+        vpad_send_data_slot(dev->vpad_slot, &ds4);
     }
 }
 
 // -------------------------------------------------------------
 // Non-Blocking Polling Step (250 Hz Daemon Loop)
 // -------------------------------------------------------------
+
+/* One registration with the Bluetooth driver.
+ *
+ * ioctl 0x8004622B tells the driver to hand devices matching this VID/PID to our
+ * /dev/bt descriptor. Upstream calls it once. Whether the driver keeps one entry
+ * per pair -- which would leave a second identical controller with nowhere to
+ * land -- is what ONEFAMILY_BT_EXTRA_REG exists to find out, so every call's
+ * return value is logged rather than discarded.
+ */
+static long bt_register_pair(uint16_t vid, uint16_t pid, const char *what) {
+    struct {
+        uint16_t vendor;
+        uint16_t product;
+    } device = { vid, pid };
+    long rc = daemon_syscall(SYS_IOCTL, s_bt_fd, 0x8004622BUL, (long)&device);
+    daemon_log(LOG_LEVEL_INFO, "register %s (%04X:%04X) = %ld", what, vid, pid, rc);
+    return rc;
+}
+
+static long bt_unregister_pair(uint16_t vid, uint16_t pid) {
+    struct {
+        uint16_t vendor;
+        uint16_t product;
+    } device = { vid, pid };
+    long rc = daemon_syscall(SYS_IOCTL, s_bt_fd, 0x8004622CUL, (long)&device);
+    daemon_log(LOG_LEVEL_INFO, "unregister (%04X:%04X) = %ld", vid, pid, rc);
+    return rc;
+}
+
+// Each controller times out on its own clock: one player setting a pad down
+// must not drop anybody else. Runs on every poll step, including steps that do
+// have an event to read, so a silent pad still expires while the others play.
+static void bt_check_timeouts(void) {
+    uint64_t now = daemon_sys_time_us();
+
+    for (int i = 0; i < BT_MAX_DEVICES; ++i) {
+        BtDevice *dev = &s_devices[i];
+        if (!dev->address) continue;
+
+        // Already away: its pad is being held for it. Release it only once the
+        // grace window has run out.
+        if (!dev->connected && dev->vpad_slot >= 0) {
+            if (now - dev->away_since <= BT_PAD_GRACE_US) continue;
+
+            int player = vpad_get_assigned_slot_num(dev->vpad_slot);
+            daemon_log(LOG_LEVEL_INFO,
+                       "controller_disconnected: DualSense BT 0x%llX gone past the grace window, releasing Slot %d (Player %d)",
+                       (unsigned long long)dev->address, dev->vpad_slot, player);
+            bt_dev_release(dev);
+            daemon_notify("OneFamily: DualSense (Player %d) Disconnected", player);
+            continue;
+        }
+
+        if (now - dev->last_input_time <= BT_INPUT_TIMEOUT_US) continue;
+
+        if (!dev->connected) {
+            // Claimed an entry but never produced a decodable report, so it
+            // holds no pad: free it quietly for a real controller.
+            daemon_log(LOG_LEVEL_INFO, "DualSense BT: dropping silent device 0x%llX (entry %d)",
+                       (unsigned long long)dev->address, i);
+            bt_dev_release(dev);
+            continue;
+        }
+
+        // Just went quiet. Keep the pad, and with it the account, in case this
+        // is a controller switching off or stepping out of range.
+        int player = dev->vpad_slot >= 0 ? vpad_get_assigned_slot_num(dev->vpad_slot) : 0;
+        daemon_log(LOG_LEVEL_INFO,
+                   "controller_away: DualSense BT 0x%llX quiet %llu ms, holding Slot %d (Player %d) for %llu s "
+                   "[reports=%u decode_drops=%u last_drop len=%u id=0x%02X]",
+                   (unsigned long long)dev->address,
+                   (unsigned long long)((now - dev->last_input_time) / 1000ULL),
+                   dev->vpad_slot, player,
+                   (unsigned long long)(BT_PAD_GRACE_US / 1000000ULL),
+                   dev->reports_seen, dev->decode_drops,
+                   dev->last_drop_len, dev->last_drop_id);
+        bt_dev_mark_away(dev, now);
+    }
+}
 
 void bt_driver_poll_step(void) {
     if (!s_bt_running || s_bt_fd < 0 || s_bt_queue < 0) return;
@@ -537,18 +955,14 @@ void bt_driver_poll_step(void) {
     } event;
 
     long ready = daemon_sys_call6(SYS_KEVENT, s_bt_queue, 0, 0, (long)&event, 1, (long)&timeout);
+
+    bt_check_timeouts();
+
+#ifdef ONEFAMILY_BT_DIAG
+    bt_diag_dump();
+#endif
+
     if (ready <= 0) {
-        // Check 3-second timeout for disconnection
-        if (s_dualsense_connected && (daemon_sys_time_us() - s_last_input_time > 3000000ULL)) {
-            s_dualsense_connected = false;
-            s_physical_address = 0;
-            if (s_bt_vpad_slot >= 0) {
-                vpad_slot_close(s_bt_vpad_slot);
-                s_bt_vpad_slot = -1;
-            }
-            daemon_log(LOG_LEVEL_INFO, "controller_disconnected: DualSense BT timed out");
-            daemon_notify("OneFamily: DualSense Disconnected");
-        }
         return;
     }
 
@@ -557,12 +971,20 @@ void bt_driver_poll_step(void) {
     if (count > 0 && count <= (long)sizeof(buffer)) {
         for (long pos = 0; pos + 16 <= count; pos += 16) {
             uint8_t ev_type = buffer[pos];
-            if (ev_type < 0x18 || ev_type > 0x20) continue;
 
+            // The address is read before the type filter: an event of a type we
+            // ignore still says which controller it came from, which is what a
+            // diagnostic build needs in order to account for every event.
             uint64_t address = 0;
             for (unsigned i = 0; i < 8; ++i) {
                 address |= ((uint64_t)buffer[pos + 8 + i]) << (8 * i);
             }
+
+#ifdef ONEFAMILY_BT_DIAG
+            bt_diag_event(ev_type, address, &buffer[pos]);
+#endif
+
+            if (ev_type < 0x18 || ev_type > 0x20) continue;
 
             uint8_t report[80];
             memset(report, 0, sizeof(report));
@@ -574,9 +996,28 @@ void bt_driver_poll_step(void) {
             } req = { address, report, sizeof(report), 0 };
 
             long result = daemon_syscall(SYS_IOCTL, s_bt_fd, 0x80206233UL, (long)&req);
-            if (result >= 2 && result <= 80 && report[0] + 2 == result && report[1] == 0x1F) {
-                s_physical_address = address;
-                decode_dualsense_bt_report(report + 2, (size_t)(result - 2));
+            int ok = (result >= 2 && result <= 80 && report[0] + 2 == result && report[1] == 0x1F);
+#ifdef ONEFAMILY_BT_DIAG
+            bt_diag_report(address, result, report, ok);
+#endif
+            if (ok) {
+                // The address came from the event, so the report goes to that
+                // controller's entry -- never to a single shared one.
+                BtDevice *dev = bt_dev_acquire(address);
+                if (dev) {
+                    /* A valid pad report for this address means the controller
+                     * is alive, whatever the decoder then makes of its contents.
+                     * Tying liveness to a successful decode instead conflated
+                     * "alive" with "a report shape we understand", so a run of
+                     * reports the decoder skips -- an unexpected length, a bad
+                     * CRC, a reserved D-pad value -- used to expire a controller
+                     * that was transmitting perfectly well, destroying its pad
+                     * and its account along with it. */
+                    ++dev->reports_seen;
+                    dev->last_input_time = daemon_sys_time_us();
+
+                    decode_dualsense_bt_report(dev, report + 2, (size_t)(result - 2));
+                }
             }
         }
     }
@@ -587,7 +1028,9 @@ void bt_driver_poll_step(void) {
 // -------------------------------------------------------------
 
 int bt_driver_init(void) {
-    daemon_log(LOG_LEVEL_INFO, "Initializing DualSense Bluetooth Subsystem...");
+    daemon_log(LOG_LEVEL_INFO, "Initializing DualSense Bluetooth Subsystem (up to %d controllers)...",
+               BT_MAX_DEVICES);
+    bt_devices_reset();
 
     // 1. Verify firmware version (sceKernelGetSystemSwVersion)
     struct {
@@ -680,12 +1123,7 @@ int bt_driver_init(void) {
     }
 
     // 7. Register DualSense device with Bluetooth driver (ioctl 0x8004622B)
-    struct {
-        uint16_t vendor;
-        uint16_t product;
-    } device = { SONY_VID, SONY_DUALSENSE_PID };
-    long reg_rc = daemon_syscall(SYS_IOCTL, s_bt_fd, 0x8004622BUL, (long)&device);
-    daemon_log(LOG_LEVEL_INFO, "register_dualsense = %ld", reg_rc);
+    long reg_rc = bt_register_pair(SONY_VID, SONY_DUALSENSE_PID, "dualsense");
     if (reg_rc != 0) {
         // Registration failed: restore allowlist, close descriptors, return cleanly
         apply_kernel_allowlist_patch(1 /* restore */, s_current_fw_bcd);
@@ -698,6 +1136,27 @@ int bt_driver_init(void) {
     }
 
     s_bt_registered = true;
+    s_bt_reg_count = 1;
+
+    /* One more registration per additional controller. Best effort: the first
+     * registration above is the one that gates the subsystem, and a failure
+     * here only costs a player, never the controller that already works. */
+    for (int i = 1; i < ONEFAMILY_BT_REGISTRATIONS; ++i) {
+        if (bt_register_pair(SONY_VID, SONY_DUALSENSE_PID, "dualsense (slot)") == 0) {
+            ++s_bt_reg_count;
+        }
+    }
+
+#ifdef ONEFAMILY_BT_REGISTER_EDGE
+    /* The Edge's own PID is refused on FW 12.52, so this is off by default
+     * rather than printing an error into everybody's log on every boot. */
+    bt_register_pair(SONY_VID, SONY_DUALSENSE_EDGE_PID, "dualsense edge");
+#endif
+
+    daemon_log(LOG_LEVEL_INFO,
+               "DualSense BT: %d of %d registrations held -> room for %d simultaneous controllers",
+               s_bt_reg_count, ONEFAMILY_BT_REGISTRATIONS, s_bt_reg_count);
+
     s_bt_running = true;
     s_bt_supported = true;
     daemon_log(LOG_LEVEL_INFO, "DualSense Bluetooth Subsystem initialized successfully (FW 0x%04X)", s_current_fw_bcd);
@@ -712,12 +1171,14 @@ void bt_driver_shutdown(void) {
     s_bt_supported = false;
 
     if (s_bt_registered && s_bt_fd >= 0) {
-        struct {
-            uint16_t vendor;
-            uint16_t product;
-        } device = { SONY_VID, SONY_DUALSENSE_PID };
-        long unreg_rc = daemon_syscall(SYS_IOCTL, s_bt_fd, 0x8004622CUL, (long)&device);
-        daemon_log(LOG_LEVEL_INFO, "unregister_dualsense = %ld", unreg_rc);
+        // Give back exactly as many registrations as were taken.
+        for (int i = 0; i < s_bt_reg_count; ++i) {
+            bt_unregister_pair(SONY_VID, SONY_DUALSENSE_PID);
+        }
+#ifdef ONEFAMILY_BT_REGISTER_EDGE
+        bt_unregister_pair(SONY_VID, SONY_DUALSENSE_EDGE_PID);
+#endif
+        s_bt_reg_count = 0;
         s_bt_registered = false;
     }
 
@@ -733,12 +1194,12 @@ void bt_driver_shutdown(void) {
         s_bt_fd = -1;
     }
 
-    if (s_bt_vpad_slot >= 0) {
-        vpad_slot_close(s_bt_vpad_slot);
-        s_bt_vpad_slot = -1;
+    for (int i = 0; i < BT_MAX_DEVICES; ++i) {
+        if (s_devices[i].address) {
+            bt_dev_release(&s_devices[i]);
+        }
     }
-    s_dualsense_connected = false;
-    s_physical_address = 0;
+    bt_devices_reset();
 }
 
 bool bt_driver_is_supported(void) {
@@ -746,18 +1207,25 @@ bool bt_driver_is_supported(void) {
 }
 
 bool bt_driver_is_connected(void) {
-    return s_dualsense_connected;
+    return bt_driver_connected_count() > 0;
 }
 
-void bt_driver_send_rumble(uint8_t large, uint8_t small, const uint8_t color[3]) {
-    if (!s_bt_running || s_bt_fd < 0 || !s_dualsense_connected || !s_physical_address) return;
+int bt_driver_connected_count(void) {
+    int n = 0;
+    for (int i = 0; i < BT_MAX_DEVICES; ++i) {
+        if (s_devices[i].connected) ++n;
+    }
+    return n;
+}
 
-    static uint8_t seq = 0;
+static void bt_send_rumble_dev(BtDevice *dev, uint8_t large, uint8_t small, const uint8_t color[3]) {
+    if (!s_bt_running || s_bt_fd < 0 || !dev || !dev->connected || !dev->address) return;
+
     uint8_t out[78];
     memset(out, 0, sizeof(out));
 
     out[0] = 0x31;                  // Report ID
-    out[1] = (seq++ & 0x0F) << 4;   // Sequence tag
+    out[1] = (dev->rumble_seq++ & 0x0F) << 4;   // Sequence tag, per controller
     out[2] = 0x10;
     out[3] = 0x03;                  // Enable motors
     out[4] = 0x14;
@@ -781,13 +1249,34 @@ void bt_driver_send_rumble(uint8_t large, uint8_t small, const uint8_t color[3])
         out[74 + i] = (uint8_t)(crc >> (8 * i));
     }
 
-    // Send Bluetooth output request via ioctl with actual controller physical address
+    // Send Bluetooth output request via ioctl, addressed to this controller
     struct {
         uint64_t address;
         void* buffer;
         uint64_t size;
         uint64_t report_id;
-    } req = { s_physical_address, out, 78, 0x31 };
+    } req = { dev->address, out, 78, 0x31 };
 
     daemon_syscall(SYS_IOCTL, s_bt_fd, 0x80206232UL, (long)&req);
+}
+
+void bt_driver_send_rumble_slot(int vpad_slot, uint8_t large, uint8_t small, const uint8_t color[3]) {
+    if (vpad_slot < 0) return;
+
+    for (int i = 0; i < BT_MAX_DEVICES; ++i) {
+        if (s_devices[i].connected && s_devices[i].vpad_slot == vpad_slot) {
+            bt_send_rumble_dev(&s_devices[i], large, small, color);
+            return;
+        }
+    }
+}
+
+void bt_driver_send_rumble(uint8_t large, uint8_t small, const uint8_t color[3]) {
+    // No slot given: the first connected controller is the only sensible target.
+    for (int i = 0; i < BT_MAX_DEVICES; ++i) {
+        if (s_devices[i].connected) {
+            bt_send_rumble_dev(&s_devices[i], large, small, color);
+            return;
+        }
+    }
 }

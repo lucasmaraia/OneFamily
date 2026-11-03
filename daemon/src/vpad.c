@@ -16,9 +16,19 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* AddDevice's parameter block.
+ *
+ * 16 bytes, as upstream has it. Control4Free declares 32, and declaring 32 here
+ * was tried on FW 12.52: the call accepts it and returns the same handles, so
+ * the extra words change nothing and the smaller struct stays.
+ *
+ * The word at offset 4 is `userId`, not `type`: Control4Free names it that and
+ * documents that the value 1 means "arrives with no user, so the PS4 opens its
+ * 'Who's using this controller?' screen", which is exactly what both projects
+ * pass and exactly what both see. */
 typedef struct {
     uint32_t size;
-    uint32_t type;
+    uint32_t userId;      // 1 = unassigned, let the PS4 ask who is using it
     uint32_t flags;
     uint32_t reserved;
 } ScePadVirtualDeviceParam;
@@ -89,6 +99,8 @@ typedef struct {
     uint8_t last_rumble_sm;
     uint64_t last_rumble_send_us;
     int assigned_slot;
+    uint64_t device_key;
+    uint64_t mbus_device_id;   // what the system binds accounts to; 0 until known
     char assigned_username[64];
 } VPadSlotState;
 
@@ -521,14 +533,196 @@ static int vpad_ensure_subsystem(void) {
     return 0;
 }
 
-int vpad_slot_open(VPadSource source, int *out_slot) {
+/* ---- which account owns each pad, read out of the kernel log ----
+ *
+ * libScePad hands back a handle (0x6030D, 0x8030C) that is NOT the MBus DeviceId
+ * the system binds accounts to (0x90300). Different namespaces, and nothing in
+ * userland maps one to the other, so this daemon has had no way to say which
+ * account owns which pad -- the question that matters when a controller set up
+ * as Guest ends up driving the main user's screen.
+ *
+ * The login manager announces both facts in the kernel log and nowhere else:
+ *
+ *   SCE_MBUS_EVENT_DEVICE_ADDED [DeviceId:0x90300][type:1][subType:2]
+ *   [Assign] DeviceId:0x0000000000090300 / UserId:0x20b7c46a
+ *   SCE_MBUS_EVENT_DEVICE_OWNER_CHANGED [DeviceId:0x90300][UserId:0x20b7c46a]
+ *
+ * subType 2 is the virtual (Remote Play) pad, which is what we create, so the
+ * first line ties a DeviceId to the slot we just opened and the other two tie
+ * that DeviceId to an account. Both then go into this daemon's own log next to
+ * the slot number, which is the point: one log, one clock, whole story. Reading
+ * the kernel log for this is the technique described in Control4Free's docs; it
+ * is GPL-3.0 and none of its code is used here.
+ *
+ * /dev/klog has a single reader: while this build holds it, GoldHEN's log server
+ * on port 3232 cannot serve anyone. That is why it is behind a build flag.
+ */
+#ifdef ONEFAMILY_OWNER_WATCH
+
+static int      s_klog_fd = -1;
+static int      s_klog_pending_slot = -1;   /* slot still waiting for its DeviceId */
+static char     s_klog_line[1024];
+static size_t   s_klog_line_len = 0;
+static uint64_t s_klog_retry_us = 0;
+
+/* The hex number following `marker`, with or without an 0x prefix. */
+static uint64_t vpad_hex_after(const char *s, const char *marker) {
+    const char *p = strstr(s, marker);
+    if (!p) return 0;
+    p += strlen(marker);
+    while (*p == ' ') ++p;
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) p += 2;
+
+    uint64_t v = 0;
+    int n = 0;
+    for (; n < 16; ++n, ++p) {
+        int d;
+        char c = *p;
+        if (c >= '0' && c <= '9')      d = c - '0';
+        else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+        else break;
+        v = (v << 4) | (uint64_t)d;
+    }
+    return n ? v : 0;
+}
+
+static int vpad_slot_of_device(uint64_t device_id) {
+    for (int i = 0; i < VPAD_MAX_SLOTS; i++) {
+        if (g_slots[i].active && g_slots[i].mbus_device_id == device_id) return i;
+    }
+    return -1;
+}
+
+static void vpad_name_of_user(uint32_t user_id, char *out, size_t size) {
+    out[0] = '\0';
+    init_user_service();
+    if (p_sceUserServiceGetUserName) {
+        p_sceUserServiceGetUserName((SceUserServiceUserId)user_id, out, size);
+    }
+    if (out[0] == '\0') {
+        snprintf(out, size, "0x%08X", user_id);
+    }
+}
+
+static void vpad_klog_handle_line(const char *line) {
+    /* A virtual pad was created: claim it for the slot that is waiting. */
+    if (strstr(line, "SCE_MBUS_EVENT_DEVICE_ADDED") && strstr(line, "subType:2")) {
+        uint64_t id = vpad_hex_after(line, "DeviceId:");
+        if (!id) return;
+
+        int slot = s_klog_pending_slot;
+        if (slot >= 0 && slot < VPAD_MAX_SLOTS && g_slots[slot].active) {
+            g_slots[slot].mbus_device_id = id;
+            s_klog_pending_slot = -1;
+            daemon_log(LOG_LEVEL_INFO,
+                       "owner_watch: Slot %d (handle=0x%X) is MBus DeviceId 0x%llX",
+                       slot, g_slots[slot].handle, (unsigned long long)id);
+        } else {
+            daemon_log(LOG_LEVEL_INFO,
+                       "owner_watch: virtual pad 0x%llX added with no slot waiting for it",
+                       (unsigned long long)id);
+        }
+        return;
+    }
+
+    int is_assign = (strstr(line, "[Assign] DeviceId:") != NULL);
+    int is_owner  = (strstr(line, "SCE_MBUS_EVENT_DEVICE_OWNER_CHANGED") != NULL);
+    if (!is_assign && !is_owner) return;
+
+    uint64_t id  = vpad_hex_after(line, "DeviceId:");
+    uint64_t uid = vpad_hex_after(line, "UserId:");
+    if (!id) return;
+
+    char name[64];
+    vpad_name_of_user((uint32_t)uid, name, sizeof(name));
+    int slot = vpad_slot_of_device(id);
+
+    if (slot >= 0) {
+        daemon_log(LOG_LEVEL_INFO,
+                   "owner_watch: Slot %d (Player %d, MBus 0x%llX) belongs to '%s' (0x%08X) [%s]",
+                   slot, g_slots[slot].assigned_slot, (unsigned long long)id,
+                   name, (uint32_t)uid, is_owner ? "owner_changed" : "assign");
+    } else {
+        daemon_log(LOG_LEVEL_INFO,
+                   "owner_watch: device 0x%llX belongs to '%s' (0x%08X) [%s, not one of our pads]",
+                   (unsigned long long)id, name, (uint32_t)uid,
+                   is_owner ? "owner_changed" : "assign");
+    }
+}
+
+/* Throw away whatever is already queued, so the first poll does not report a
+ * backlog of events from before this daemon started. */
+static void vpad_klog_drain(void) {
+    char chunk[1024];
+    int guard = 0;
+    while (guard++ < 256) {
+        int n = daemon_sys_read(s_klog_fd, chunk, sizeof(chunk));
+        if (n <= 0) break;
+    }
+    s_klog_line_len = 0;
+}
+
+void vpad_owner_watch_poll(void) {
+    if (s_klog_fd < 0) {
+        uint64_t now = daemon_sys_time_us();
+        if (now < s_klog_retry_us) return;
+        s_klog_retry_us = now + 5000000ULL;
+
+        /* O_RDONLY | O_NONBLOCK */
+        s_klog_fd = daemon_sys_open("/dev/klog", 0x0004, 0);
+        if (s_klog_fd < 0) {
+            daemon_log(LOG_LEVEL_WARN,
+                       "owner_watch: /dev/klog unavailable (GoldHEN's log server may hold it); will retry");
+            return;
+        }
+        vpad_klog_drain();
+        daemon_log(LOG_LEVEL_INFO, "owner_watch: reading /dev/klog, backlog discarded");
+    }
+
+    char chunk[1024];
+    int rounds = 0;
+    while (rounds++ < 64) {
+        int n = daemon_sys_read(s_klog_fd, chunk, sizeof(chunk));
+        if (n <= 0) break;
+
+        for (int i = 0; i < n; ++i) {
+            char c = chunk[i];
+            if (c == '\n' || c == '\r') {
+                if (s_klog_line_len) {
+                    s_klog_line[s_klog_line_len] = '\0';
+                    vpad_klog_handle_line(s_klog_line);
+                    s_klog_line_len = 0;
+                }
+            } else if (s_klog_line_len + 1 < sizeof(s_klog_line)) {
+                s_klog_line[s_klog_line_len++] = c;
+            }
+        }
+        if (n < (int)sizeof(chunk)) break;
+    }
+}
+
+void vpad_owner_note_pad_open(int slot) {
+    s_klog_pending_slot = slot;
+}
+
+#else  /* ONEFAMILY_OWNER_WATCH */
+
+void vpad_owner_watch_poll(void) {}
+void vpad_owner_note_pad_open(int slot) { (void)slot; }
+
+#endif /* ONEFAMILY_OWNER_WATCH */
+
+int vpad_slot_open_dev(VPadSource source, uint64_t device_key, int *out_slot) {
     if (vpad_ensure_subsystem() != 0) {
         return -1;
     }
 
-    // Check if this source already has an active slot
+    // Check whether this physical device already holds a slot. Matching on the
+    // device key as well as the source is what gives a second DualSense a slot
+    // of its own instead of making it share the first one's virtual pad.
     for (int i = 0; i < VPAD_MAX_SLOTS; i++) {
-        if (g_slots[i].active && g_slots[i].source == source) {
+        if (g_slots[i].active && g_slots[i].source == source && g_slots[i].device_key == device_key) {
             if (out_slot) *out_slot = i;
             return 0;
         }
@@ -560,11 +754,14 @@ int vpad_slot_open(VPadSource source, int *out_slot) {
     ScePadVirtualDeviceParam param;
     memset(&param, 0, sizeof(param));
     param.size = sizeof(param);
-    param.type = 1; // Device Type 1 = DualShock 4
+    param.userId = 1;   // unassigned: the PS4 opens its user picker for this pad
     param.flags = 0;
 
     int vHandle = -1;
     int ret = p_scePadVirtualDeviceAddDevice(&param, &vHandle);
+    daemon_log(LOG_LEVEL_INFO,
+               "AddDevice(size=%u, userId=%u) = 0x%08X, handle=0x%X",
+               param.size, param.userId, (uint32_t)ret, vHandle);
     if (ret < 0 || vHandle < 0) {
         daemon_log(LOG_LEVEL_ERROR, "scePadVirtualDeviceAddDevice(type 1) failed for slot %d: 0x%08X", slot, ret);
         return ret;
@@ -575,25 +772,33 @@ int vpad_slot_open(VPadSource source, int *out_slot) {
     g_slots[slot].active = true;
     g_slots[slot].source = source;
     g_slots[slot].assigned_slot = slot + 1;
+    g_slots[slot].device_key = device_key;
+    g_slots[slot].mbus_device_id = 0;
+    vpad_owner_note_pad_open(slot);
     snprintf(g_slots[slot].assigned_username, sizeof(g_slots[slot].assigned_username), "User %d", slot + 1);
 
     g_vpad_active = true;
     g_vpad_handle = vHandle;
 
-    daemon_log(LOG_LEVEL_INFO, "Virtual DS4 Slot %d (%s) registered with handle=0x%X",
-               slot, source == VPAD_SOURCE_BT ? "Bluetooth" : "USB", vHandle);
+    daemon_log(LOG_LEVEL_INFO, "Virtual DS4 Slot %d (%s, key=0x%llX) registered with handle=0x%X -> Player %d",
+               slot, source == VPAD_SOURCE_BT ? "Bluetooth" : "USB",
+               (unsigned long long)device_key, vHandle, g_slots[slot].assigned_slot);
 
     if (p_scePadSetConnection) {
         int r = p_scePadSetConnection(vHandle, 1);
         daemon_log(LOG_LEVEL_INFO, "scePadSetConnection(0x%X, 1) = 0x%08X", vHandle, r);
     }
 
-    // Automatically trigger PS button pulse so SceShellCore opens the native
-    // "Who is using this controller?" user picker screen!
+    // Pulse PS so SceShellCore opens its native "Who is using this
+    // controller?" picker for this pad.
     vpad_pulse_ps_button_slot(slot);
 
     if (out_slot) *out_slot = slot;
     return 0;
+}
+
+int vpad_slot_open(VPadSource source, int *out_slot) {
+    return vpad_slot_open_dev(source, 0, out_slot);
 }
 
 void vpad_slot_close(int slot) {
@@ -766,8 +971,21 @@ void vpad_poll_rumble(void) {
                 g_slots[i].last_rumble_send_us = now;
 
                 if (g_slots[i].source == VPAD_SOURCE_BT) {
-                    uint8_t color[3] = { setting[5], setting[6], setting[7] };
-                    bt_driver_send_rumble(lg, sm, color);
+                    /* enable_rumble was only ever honored on the USB path, so a
+                     * Bluetooth DualSense rumbled whatever the setting said.
+                     *
+                     * It matters beyond preference: this is the only Bluetooth
+                     * *output* traffic the daemon produces -- a 78-byte report
+                     * on every change and every 100 ms while a motor runs, per
+                     * controller. With two DualSense contending for the radio,
+                     * and input streams measured going silent for seconds at a
+                     * time, switching it off is a real lever on link stability.
+                     * The light bar colour rides in the same report and stops
+                     * with it. */
+                    if (g_daemon_config.enable_rumble) {
+                        uint8_t color[3] = { setting[5], setting[6], setting[7] };
+                        bt_driver_send_rumble_slot(i, lg, sm, color);
+                    }
                 } else if (g_slots[i].source == VPAD_SOURCE_USB) {
                     if (g_rumble_cb) {
                         g_rumble_cb(lg, sm);

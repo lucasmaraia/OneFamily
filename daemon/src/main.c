@@ -97,6 +97,12 @@ int main(int argc, char *argv[]) {
         // Poll virtual DS4 rumble from OS/games
         vpad_poll_rumble();
 
+        // Pad ownership from the kernel log, ~10 Hz. Compiled out unless the
+        // build asked for it.
+        if (loop_count % 25 == 0) {
+            vpad_owner_watch_poll();
+        }
+
         // Poll companion app vibration test IPC (~50 Hz = every 5 loops)
         if (++loop_count % 5 == 0) {
             check_vibe_file();
