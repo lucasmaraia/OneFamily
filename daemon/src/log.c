@@ -15,6 +15,7 @@
 #define DAEMON_LOG_PATH "/data/onefamily/onefamily.log"
 
 static int g_log_fd = -1;
+static uint64_t g_log_base_us = 0;
 
 void daemon_log_init(void) {
     if (g_log_fd < 0) {
@@ -48,8 +49,19 @@ void daemon_log(int level, const char *fmt, ...) {
     vsnprintf(buffer, sizeof(buffer), fmt, args);
     va_end(args);
 
-    char full_msg[600];
-    snprintf(full_msg, sizeof(full_msg), "[%s] %s\n", level_to_str(level), buffer);
+    // Seconds since the first log line. Relative rather than wall clock: the
+    // question these answer is always "how long between these two lines".
+    uint64_t now = daemon_sys_time_us();
+    if (g_log_base_us == 0) {
+        g_log_base_us = now;
+    }
+    uint64_t rel = now - g_log_base_us;
+
+    char full_msg[640];
+    snprintf(full_msg, sizeof(full_msg), "[%6llu.%03llu] [%s] %s\n",
+             (unsigned long long)(rel / 1000000ULL),
+             (unsigned long long)((rel / 1000ULL) % 1000ULL),
+             level_to_str(level), buffer);
 
     if (g_log_fd < 0) {
         daemon_log_init();
