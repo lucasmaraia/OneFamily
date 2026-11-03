@@ -1,3 +1,8 @@
+> **Fork note.** This tree is a fork of ChiricoG/OneFamily that supports
+> **several DualSense controllers at once over Bluetooth**, each as its own
+> player or guest. See [FORK.md](FORK.md) for what changed, how to build it
+> with Docker, how to install the payload and what to verify on the console.
+
 <p align="center">
   <img src="assets/logo.png" alt="OneFamily Logo" width="220"/>
 </p>
