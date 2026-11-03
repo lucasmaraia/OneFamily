@@ -7,6 +7,18 @@ guest, instead of every controller driving Player 1 together.
 No code from Control4Free is used, so this fork stays MIT. See
 [Why not merge Control4Free](#why-not-merge-control4free).
 
+Reported upstream as
+[ChiricoG/OneFamily#29](https://github.com/ChiricoG/OneFamily/issues/29). That
+repository has pull requests disabled, so this fork is where the work lives; the
+findings are in the issue for the maintainer to take or leave.
+
+> **Applying this as patches** (`git format-patch` / `git am`) on a machine with
+> `core.autocrlf=true`: `.gitattributes` arrives in the same commit as
+> `tools/build_daemon.sh`, so git has already written the script by the time it
+> starts honouring `eol=lf`, and the CRLF shebang makes it unrunnable in the
+> container. `git checkout -- .` after the `am` fixes it. Cloning the fork is
+> unaffected — the attributes are in the index before anything is checked out.
+
 ## What upstream did, and where it stopped
 
 Upstream already solves the hard part. The PS4's `bthid` module carries a
