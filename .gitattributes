@@ -1,0 +1,3 @@
+# The container build runs these; CRLF would break the shebang and the Dockerfile.
+*.sh text eol=lf
+Dockerfile text eol=lf

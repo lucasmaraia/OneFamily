@@ -1,4 +1,12 @@
-$TOOLCHAIN = "C:/Users/Gianmarco/Projects/video-grab/ps4-store/tools/openorbis/OpenOrbis/PS4Toolchain"
+# The OpenOrbis PS4 toolchain: taken from OO_PS4_TOOLCHAIN, falling back to the
+# default installer location. Upstream hardcoded one developer's path here.
+$TOOLCHAIN = $env:OO_PS4_TOOLCHAIN
+if (-not $TOOLCHAIN) { $TOOLCHAIN = "C:/OpenOrbis/PS4Toolchain" }
+$TOOLCHAIN = $TOOLCHAIN.Replace('\', '/')
+if (-not (Test-Path "$TOOLCHAIN/link.x")) {
+    Write-Error "No link.x under '$TOOLCHAIN'. Set OO_PS4_TOOLCHAIN to the OpenOrbis PS4Toolchain directory, or build in Docker: see tools/build_daemon.sh."
+    exit 1
+}
 $PROJECT = $PSScriptRoot
 $CREATE_FSELF = "C:/tmp/create-fself-new.exe"
 $DAEMON_DIR = "$PROJECT/daemon"
