@@ -16,8 +16,18 @@ findings are in the issue for the maintainer to take or leave.
 > `core.autocrlf=true`: `.gitattributes` arrives in the same commit as
 > `tools/build_daemon.sh`, so git has already written the script by the time it
 > starts honouring `eol=lf`, and the CRLF shebang makes it unrunnable in the
-> container. `git checkout -- .` after the `am` fixes it. Cloning the fork is
-> unaffected — the attributes are in the index before anything is checked out.
+> container (`exec /src/tools/build_daemon.sh: no such file or directory`). Note
+> that `git checkout -- .` does *not* repair it: with `autocrlf` on, git treats
+> the CRLF working file as matching the LF blob and rewrites nothing. Delete and
+> restore the two files instead:
+>
+> ```sh
+> rm tools/build_daemon.sh docker/Dockerfile
+> git checkout -- tools/build_daemon.sh docker/Dockerfile
+> ```
+>
+> Cloning the fork is unaffected — the attributes are in the index before
+> anything is checked out.
 
 ## What upstream did, and where it stopped
 
