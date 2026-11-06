@@ -242,11 +242,11 @@ If a second pad ever fails again, the log says which stage broke:
 
 ## Known limitations
 
-- **The system screen does not switch to a guest when both controllers are
-  DualSense.** Two DualSense play together fine, each on its own account, but
-  pressing PS on the guest's controller never brings up that user's screen, and
-  the console's own *"press the PS button on the other controller"* prompt goes
-  unanswered. Everything observable about that pad is correct:
+- **Two DualSense cannot both drive the system menus.** They play together fine,
+  each on its own account; games read both. What does not work is the system UI:
+  whichever virtual pad takes menu focus first keeps it, and the other player's
+  PS press cannot take it over. The pad itself is in order — the kernel names its
+  owner, the press is held 200-300 ms, and `libScePad` accepts it:
 
   ```
   owner_watch: Slot 1 (handle=0x8030C) is MBus DeviceId 0x8030C
@@ -254,28 +254,61 @@ If a second pad ever fails again, the log says which stage broke:
   vpad_send_data_slot(1): PS Button ACTIVE (btn=0x00010000, ret=0x00000000)
   ```
 
-  The pad exists, the kernel says the guest owns it, the press is held for
-  200-300 ms and `libScePad` accepts it — and `ShellCore` either does nothing or
-  brings up the *main* user's screen. The same press on the same kind of pad
-  *does* switch the screen when the other controller is a real DualShock 4, so a
-  virtual pad is not the problem: two virtual pads are.
+  This was chased a long way and the ground moved twice, so the findings are
+  worth more than a verdict.
 
-  Five explanations were tested against the console and none survived:
+  **The screen itself can be switched**, which an earlier version of this file
+  denied. `sceShellUIUtilLaunchByUri`, given a pad owner's user id, brings that
+  user's session to the screen — verified on FW 12.52 with the owner's own name
+  shown on the page it opened, for both the main user and the guest:
+
+  ```
+  switch_user: PS on Slot 1 -> 'Convidado1' (was 'Lucas'): LaunchByUri = 0x00000000, SetForegroundUser = 0x00000000
+  foreground: 'Lucas' -> 'Convidado1' (0x20B7C477)
+  ```
+
+  Its signature and parameter block are public: OpenOrbis `orbis/ShellUIUtil.h`
+  and `orbis/_types/shell_ui.h`, the latter credited to LightningMods.
+
+  **`sceUserServiceSetForegroundUser` is not what moves the screen.** It is
+  exported, returns 0, and `GetForegroundUser` follows it — and the display does
+  not change. Who the system calls the foreground user and what is on screen are
+  two different things.
+
+  **What is left is menu focus, and nothing public reaches it.** Seven
+  explanations were tested against the console and none survived:
 
   | Idea | Outcome |
   |---|---|
   | The guest's pad is really bound to the main user | No: the kernel logs `OWNER_CHANGED … 'Convidado1'` |
-  | The controllers were swapped in the tester's hands | No: all six PS presses were on the guest's slot, and the slots are keyed to Bluetooth addresses |
+  | The controllers were swapped in the tester's hands | No: every PS press was on the guest's slot, and slots are keyed to Bluetooth addresses |
   | The PS press is too short for `ShellCore` to latch | No: 200-300 ms, the same range as presses that work |
-  | The automatic PS pulse on pad creation interferes, as Control4Free's docs warn | No: `auto_ps_pulse = 0` changed nothing, and both users still signed in |
-  | Upstream declares a 16-byte `AddDevice` param where 32 is right, leaving the pads indistinguishable | No: `vda_param_size = 32` is accepted and returns the same handles |
+  | The automatic PS pulse on pad creation interferes, as Control4Free's docs warn | No: turning it off changed nothing, and both users still signed in |
+  | Upstream declares a 16-byte `AddDevice` param where 32 is right | No: 32 is accepted and returns the same handles |
+  | The foreground user is never actually set | No: it is set, it reads back, and the screen does not follow |
+  | The two pads look identical to the shell | No: `AddDevice` accepts distinct parameter blocks (`reserved` = slot index) and nothing changes |
 
-  Nor is the failure observable from here. The shell resolves a user's pad in its
-  own process, and neither `scePadGetHandle(userId, 0, index)` nor
-  `scePadOpen` + `scePadGetDeviceId` reports anything from a payload that
-  differs between the working user and the broken one — see the inconclusive
-  `vpad_pad_probe()` and the reasoning kept with it. Going further means reverse
-  engineering `ShellCore`, so this is recorded rather than fixed.
+  Holding the triggering PS press back from the shell is what lets a switch
+  stand; letting it through makes the shell answer it with the main user's screen
+  again and undo the switch. Either way the second player cannot navigate. And
+  the shell resolves a user's pad inside its own process: neither
+  `scePadGetHandle(userId, 0, index)` nor `scePadOpen` + `scePadGetDeviceId`
+  reports anything from a payload that differs between the working user and the
+  broken one.
+
+  `sceLncUtilSetControllerFocus`, `sceLncUtilSetControllerFocusPermission` and
+  `sceSystemServiceSetControllerFocusPermission` are exported and named for
+  exactly this, but no public source gives their arguments, and guessing at them
+  risks the process the payload runs inside. Reaching past that means changing
+  how `ShellCore` arbitrates focus, which is modifying firmware rather than
+  interoperating with it, and is out of scope here.
+
+  **The `LaunchByUri` work is deliberately not in this tree.** It only half
+  worked: it opened a settings page as a side door into the user's session, which
+  the player then had to back out of, and the focus problem meant the second
+  player still could not navigate. Native PS behaviour is better, so it was
+  removed. It is written down because the finding is real and whoever picks this
+  up should not have to rediscover it.
 
   **DualSense as the guest plus a real DualShock 4 works completely**, including
   the screen switch. Connect the DualSense first: the power-off below only fires
